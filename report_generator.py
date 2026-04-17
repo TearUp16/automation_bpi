@@ -4,7 +4,6 @@ import re
 from io import BytesIO
 
 import pandas as pd
-import polars as pl
 import streamlit as st
 
 
@@ -129,8 +128,8 @@ def process_drr_file(file):
     return df
 
 
-def process_positive_status(file) -> pl.DataFrame:
-    df = pl.read_excel(file, engine="calamine")
+def process_positive_status(file) -> pd.DataFrame:
+    df = pd.read_excel(file, dtype=str)
     df.columns = [col.strip() for col in df.columns]
 
     if "STATUS" not in df.columns:
@@ -144,67 +143,51 @@ def process_positive_status(file) -> pl.DataFrame:
 
     for col_name, default_value in required_defaults.items():
         if col_name not in df.columns:
-            df = df.with_columns(pl.lit(default_value).alias(col_name))
+            df[col_name] = default_value
 
-    df = df.with_columns([
-        pl.col("STATUS").cast(pl.Utf8).fill_null("").str.strip_chars(),
-        pl.col("Account No.").cast(pl.Utf8).fill_null("").str.strip_chars().str.replace(r"\.0$", ""),
-        pl.col("Dialed Number").cast(pl.Utf8).fill_null("").str.strip_chars().str.replace(r"\.0$", ""),
-        pl.col("Month Extracted").cast(pl.Utf8).fill_null("").str.strip_chars(),
-    ])
+    for col_name in ["STATUS", "Account No.", "Dialed Number", "Month Extracted"]:
+        df[col_name] = df[col_name].fillna("").astype(str).str.strip()
 
-    df = df.with_columns(
-        pl.when(
-            (pl.col("Dialed Number") != "") &
-            (~pl.col("Dialed Number").str.starts_with("+"))
-        )
-        .then(pl.lit("+") + pl.col("Dialed Number"))
-        .otherwise(pl.col("Dialed Number"))
-        .alias("Dialed Number")
+    df["Account No."] = df["Account No."].str.replace(r"\.0$", "", regex=True)
+    df["Dialed Number"] = df["Dialed Number"].str.replace(r"\.0$", "", regex=True)
+
+    df["Dialed Number"] = df["Dialed Number"].apply(
+        lambda x: f"+{x}" if x != "" and not x.startswith("+") else x
     )
 
-    df = df.filter(
-        (pl.col("STATUS").str.to_uppercase() != "NEGATIVE") &
-        (pl.col("STATUS").str.to_uppercase() != "0") &
-        (pl.col("STATUS") != "")
-    )
+    df = df[
+        (df["STATUS"].str.upper() != "NEGATIVE") &
+        (df["STATUS"].str.upper() != "0") &
+        (df["STATUS"] != "")
+    ].copy()
 
-    df = df.with_columns(
-        (pl.col("Account No.") + pl.lit(" | ") + pl.col("Month Extracted"))
-        .alias("Account No. + Month Extracted")
-    )
+    df["Account No. + Month Extracted"] = df["Account No."] + " | " + df["Month Extracted"]
 
     new_order = ["Account No. + Month Extracted"] + [
         col for col in df.columns if col != "Account No. + Month Extracted"
     ]
 
-    return df.select(new_order)
+    return df[new_order]
 
 
-def to_excel_bytes_by_status(df: pl.DataFrame) -> bytes:
+def to_excel_bytes_by_status(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     used_sheet_names = set()
 
-    status_values = (
-        df.select("STATUS")
-        .unique()
-        .sort("STATUS")
-        .to_series()
-        .to_list()
-    )
+    status_values = sorted(df["STATUS"].dropna().astype(str).unique().tolist())
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         for status_value in status_values:
             sheet_name = clean_sheet_name(status_value, used_sheet_names)
-            sheet_df = df.filter(pl.col("STATUS") == status_value)
-            sheet_df.to_pandas().to_excel(writer, index=False, sheet_name=sheet_name)
+            sheet_df = df[df["STATUS"] == status_value]
+            sheet_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
     output.seek(0)
     return output.getvalue()
 
 
-def filter_negative_status(file) -> pl.DataFrame:
-    df = pl.read_excel(file, engine="calamine")
+def filter_negative_status(file) -> pd.DataFrame:
+    df = pd.read_excel(file, dtype=str)
     df.columns = [col.strip() for col in df.columns]
 
     if "STATUS" not in df.columns:
@@ -218,42 +201,32 @@ def filter_negative_status(file) -> pl.DataFrame:
 
     for col_name, default_value in required_defaults.items():
         if col_name not in df.columns:
-            df = df.with_columns(pl.lit(default_value).alias(col_name))
+            df[col_name] = default_value
 
-    df = df.with_columns([
-        pl.col("STATUS").cast(pl.Utf8).fill_null("").str.strip_chars(),
-        pl.col("Account No.").cast(pl.Utf8).fill_null("").str.strip_chars().str.replace(r"\.0$", ""),
-        pl.col("Dialed Number").cast(pl.Utf8).fill_null("").str.strip_chars().str.replace(r"\.0$", ""),
-        pl.col("Month Extracted").cast(pl.Utf8).fill_null("").str.strip_chars(),
-    ])
+    for col_name in ["STATUS", "Account No.", "Dialed Number", "Month Extracted"]:
+        df[col_name] = df[col_name].fillna("").astype(str).str.strip()
 
-    df = df.filter(pl.col("STATUS").str.to_uppercase() == "NEGATIVE")
+    df["Account No."] = df["Account No."].str.replace(r"\.0$", "", regex=True)
+    df["Dialed Number"] = df["Dialed Number"].str.replace(r"\.0$", "", regex=True)
 
-    df = df.with_columns(
-        pl.when(
-            (pl.col("Dialed Number") != "") &
-            (~pl.col("Dialed Number").str.starts_with("+"))
-        )
-        .then(pl.lit("+") + pl.col("Dialed Number"))
-        .otherwise(pl.col("Dialed Number"))
-        .alias("Dialed Number")
+    df = df[df["STATUS"].str.upper() == "NEGATIVE"].copy()
+
+    df["Dialed Number"] = df["Dialed Number"].apply(
+        lambda x: f"+{x}" if x != "" and not x.startswith("+") else x
     )
 
-    df = df.with_columns(
-        (pl.col("Account No.") + pl.lit(" | ") + pl.col("Month Extracted"))
-        .alias("Account No. + Month Extracted")
-    )
+    df["Account No. + Month Extracted"] = df["Account No."] + " | " + df["Month Extracted"]
 
     new_order = ["Account No. + Month Extracted"] + [
         col for col in df.columns if col != "Account No. + Month Extracted"
     ]
 
-    return df.select(new_order)
+    return df[new_order]
 
 
-def to_excel_bytes(df: pl.DataFrame) -> bytes:
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
-    df.to_pandas().to_excel(output, index=False)
+    df.to_excel(output, index=False)
     output.seek(0)
     return output.getvalue()
 
@@ -303,7 +276,7 @@ def render_report_generator(report_mode: str) -> None:
         if uploaded_file:
             try:
                 df = process_positive_status(uploaded_file)
-                st.dataframe(df.head(100).to_pandas(), use_container_width=True)
+                st.dataframe(df.head(100), use_container_width=True)
 
                 excel_data = to_excel_bytes_by_status(df)
 
@@ -325,10 +298,10 @@ def render_report_generator(report_mode: str) -> None:
             try:
                 df = filter_negative_status(uploaded_file)
 
-                if df.height == 0:
+                if df.shape[0] == 0:
                     st.warning("No NEGATIVE rows found.")
                 else:
-                    st.dataframe(df.head(100).to_pandas(), use_container_width=True)
+                    st.dataframe(df.head(100), use_container_width=True)
 
                     st.download_button(
                         "Download Filtered File",
