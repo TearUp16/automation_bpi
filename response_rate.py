@@ -8,7 +8,7 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-st.set_page_config(page_title="BPI Dashboard - Table 1 and Table 2", layout="wide")
+st.set_page_config(page_title="BPI Dashboard - Tables", layout="wide")
 
 TABLE_STATUSES: List[str] = [
     "ALL NEGATIVE",
@@ -87,19 +87,8 @@ def load_workbook(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
 
 
 def extract_month_number(value: object) -> Optional[int]:
-    """
-    Tries to convert CUT OFF MONTH values into a month number.
-
-    Supported examples:
-    - 1, 2, 3
-    - Jan, January, FEBRUARY
-    - 2024-01-31
-    - 01/15/2024
-    """
     if pd.isna(value):
         return None
-
-    # Excel / pandas date-like values
     try:
         dt = pd.to_datetime(value, errors="coerce")
         if pd.notna(dt):
@@ -114,12 +103,10 @@ def extract_month_number(value: object) -> Optional[int]:
     if text in MONTH_NAME_TO_NUM:
         return MONTH_NAME_TO_NUM[text]
 
-    # Look for month names inside longer strings
     for name, month_num in MONTH_NAME_TO_NUM.items():
         if re.search(rf"\b{name}\b", text):
             return month_num
 
-    # If it is numeric text like "1", "01", "3.0"
     numeric_match = re.fullmatch(r"(\d{1,2})(?:\.0+)?", text)
     if numeric_match:
         month_num = int(numeric_match.group(1))
@@ -134,16 +121,7 @@ def month_num_to_name(month_num: int) -> str:
 
 
 def get_month_span_label(df: pd.DataFrame) -> str:
-    """
-    Builds a title suffix from all months present in CUT OFF MONTH.
-    Examples:
-    - JANUARY
-    - JANUARY TO MARCH
-    - JANUARY TO DECEMBER
-    - ALL MONTHS
-    """
     cutoff_col = resolve_column(df, by_name="CUT OFF MONTH", by_excel_index=8)
-
     months = (
         df[cutoff_col]
         .map(extract_month_number)
@@ -151,119 +129,165 @@ def get_month_span_label(df: pd.DataFrame) -> str:
         .astype(int)
         .tolist()
     )
-
     if not months:
         return "ALL MONTHS"
-
     unique_months = sorted(set(months))
     if len(unique_months) == 1:
         return month_num_to_name(unique_months[0])
-
     return f"{month_num_to_name(min(unique_months))} TO {month_num_to_name(max(unique_months))}"
 
 
+def get_detected_months(df: pd.DataFrame) -> List[int]:
+    cutoff_col = resolve_column(df, by_name="CUT OFF MONTH", by_excel_index=8)
+    months = (
+        df[cutoff_col]
+        .map(extract_month_number)
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+    return sorted(set(months))
+
+
 def filter_by_cutoff_month(df: pd.DataFrame, target_month: int) -> pd.DataFrame:
-    """
-    Helper for the next tables.
-    This filters the dataset to one month based on CUT OFF MONTH.
-    """
     cutoff_col = resolve_column(df, by_name="CUT OFF MONTH", by_excel_index=8)
     working = df.copy()
     working["_cutoff_month_num"] = working[cutoff_col].map(extract_month_number)
     return working[working["_cutoff_month_num"] == target_month].copy()
 
 
+def filter_ptp(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter to PTP rows: REMARKS (PTP/NO PTP) == 'PTP'"""
+    remarks_col = resolve_column(df, by_name="REMARKS (PTP/NO PTP)", by_excel_index=61)
+    return df[df[remarks_col].apply(normalize_text) == "PTP"].copy()
+
+
+def filter_cured(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter to CURED rows: FINAL STATUS == 'CURED'"""
+    final_col = resolve_column(df, by_name="FINAL STATUS", by_excel_index=11)
+    return df[df[final_col].apply(normalize_text) == "CURED"].copy()
+
+
 def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
-    cycle_col = resolve_column(df, by_name="CYCLE", by_excel_index=2)
-    ob_col = resolve_column(df, by_name="OB", by_excel_index=5)
+    """Overall summary table: COUNT OF ACCOUNT CYCLE + OB PER CYCLE"""
+    cycle_col   = resolve_column(df, by_name="CYCLE",                    by_excel_index=2)
+    ob_col      = resolve_column(df, by_name="OB",                       by_excel_index=5)
     contact_col = resolve_column(df, by_name="CONTACT SOURCE (OVERALL)", by_excel_index=55)
 
     working = df.copy()
-    working[cycle_col] = working[cycle_col].fillna("").astype(str).str.strip()
+    working[cycle_col]   = working[cycle_col].fillna("").astype(str).str.strip()
     working[contact_col] = working[contact_col].map(normalize_status)
-    working[ob_col] = pd.to_numeric(working[ob_col], errors="coerce").fillna(0)
+    working[ob_col]      = pd.to_numeric(working[ob_col], errors="coerce").fillna(0)
     working = working[working[cycle_col].ne("")].copy()
 
     cycle_order = (
         working[[cycle_col]]
         .drop_duplicates()
-        .assign(_cycle_num=lambda x: x[cycle_col].astype(str).str.extract(r"(\d+)").astype(float))
-        .sort_values(["_cycle_num", cycle_col])[cycle_col]
+        .assign(_n=lambda x: x[cycle_col].astype(str).str.extract(r"(\d+)").astype(float))
+        .sort_values(["_n", cycle_col])[cycle_col]
         .tolist()
     )
 
-    rows: List[Dict[Tuple[str, str], object]] = []
+    rows: List[Dict] = []
     for cycle in cycle_order:
         cycle_df = working[working[cycle_col] == cycle]
-        row: Dict[Tuple[str, str], object] = {("", "Row Labels"): cycle}
-
+        row: Dict = {("", "Row Labels"): cycle}
         for status in TABLE_STATUSES:
-            status_df = cycle_df[cycle_df[contact_col] == status]
-            row[(status, "COUNT OF ACCOUNT CYCLE")] = int(len(status_df))
-            row[(status, "OB PER CYCLE")] = float(status_df[ob_col].sum())
-
+            s_df = cycle_df[cycle_df[contact_col] == status]
+            row[(status, "COUNT OF ACCOUNT CYCLE")] = int(len(s_df))
+            row[(status, "OB PER CYCLE")]            = float(s_df[ob_col].sum())
         row[("TOTAL", "TOTAL COUNT OF CASES")] = int(len(cycle_df))
-        row[("TOTAL", "TOTAL OB")] = float(cycle_df[ob_col].sum())
+        row[("TOTAL", "TOTAL OB")]             = float(cycle_df[ob_col].sum())
         rows.append(row)
 
     summary = pd.DataFrame(rows)
     summary.columns = pd.MultiIndex.from_tuples(summary.columns)
 
-    total_row: Dict[Tuple[str, str], object] = {("", "Row Labels"): "Grand Total"}
+    total_row: Dict = {("", "Row Labels"): "Grand Total"}
     for col in summary.columns:
         if col != ("", "Row Labels"):
             total_row[col] = summary[col].sum()
-
     summary = pd.concat([summary, pd.DataFrame([total_row])], ignore_index=True)
     return summary
 
 
-def build_percentage_table(summary: pd.DataFrame) -> pd.DataFrame:
-    detail = summary[summary[("", "Row Labels")].astype(str).str.upper() != "GRAND TOTAL"].copy()
+def build_sub_summary_table(df: pd.DataFrame) -> pd.DataFrame:
+    """PTP / CURED summary table: NO. OF CASES + OB"""
+    cycle_col   = resolve_column(df, by_name="CYCLE",                    by_excel_index=2)
+    ob_col      = resolve_column(df, by_name="OB",                       by_excel_index=5)
+    contact_col = resolve_column(df, by_name="CONTACT SOURCE (OVERALL)", by_excel_index=55)
 
-    rows: List[Dict[Tuple[str, str], object]] = []
+    working = df.copy()
+    working[cycle_col]   = working[cycle_col].fillna("").astype(str).str.strip()
+    working[contact_col] = working[contact_col].map(normalize_status)
+    working[ob_col]      = pd.to_numeric(working[ob_col], errors="coerce").fillna(0)
+    working = working[working[cycle_col].ne("")].copy()
+
+    cycle_order = (
+        working[[cycle_col]]
+        .drop_duplicates()
+        .assign(_n=lambda x: x[cycle_col].astype(str).str.extract(r"(\d+)").astype(float))
+        .sort_values(["_n", cycle_col])[cycle_col]
+        .tolist()
+    )
+
+    rows: List[Dict] = []
+    for cycle in cycle_order:
+        cycle_df = working[working[cycle_col] == cycle]
+        row: Dict = {("", "Row Labels"): cycle}
+        for status in TABLE_STATUSES:
+            s_df = cycle_df[cycle_df[contact_col] == status]
+            row[(status, "NO. OF CASES")] = int(len(s_df))
+            row[(status, "OB")]           = float(s_df[ob_col].sum())
+        row[("TOTAL", "TOTAL COUNT OF CASES")] = int(len(cycle_df))
+        row[("TOTAL", "TOTAL OB")]             = float(cycle_df[ob_col].sum())
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    summary.columns = pd.MultiIndex.from_tuples(summary.columns)
+
+    total_row: Dict = {("", "Row Labels"): "Grand Total"}
+    for col in summary.columns:
+        if col != ("", "Row Labels"):
+            total_row[col] = summary[col].sum()
+    summary = pd.concat([summary, pd.DataFrame([total_row])], ignore_index=True)
+    return summary
+
+
+def build_percentage_table(summary: pd.DataFrame, is_sub: bool = False) -> pd.DataFrame:
+    """Build rate table. is_sub=True uses NO. OF CASES/OB keys."""
+    count_key = "NO. OF CASES"        if is_sub else "COUNT OF ACCOUNT CYCLE"
+    ob_key    = "OB"                   if is_sub else "OB PER CYCLE"
+
+    detail = summary[summary[("", "Row Labels")].astype(str).str.upper() != "GRAND TOTAL"].copy()
+    rows: List[Dict] = []
+
     for _, row in detail.iterrows():
         total_count = row[("TOTAL", "TOTAL COUNT OF CASES")]
-        total_ob = row[("TOTAL", "TOTAL OB")]
-
-        pct_row: Dict[Tuple[str, str], object] = {
-            ("", "Row Labels"): row[("", "Row Labels")]
-        }
-
+        total_ob    = row[("TOTAL", "TOTAL OB")]
+        pct_row: Dict = {("", "Row Labels"): row[("", "Row Labels")]}
         for status in TABLE_STATUSES:
-            count_val = row[(status, "COUNT OF ACCOUNT CYCLE")]
-            ob_val = row[(status, "OB PER CYCLE")]
-
-            pct_row[(status, "COUNT %")] = (count_val / total_count) if total_count else 0
-            pct_row[(status, "OB %")] = (ob_val / total_ob) if total_ob else 0
-
+            pct_row[(status, "COUNT %")] = (row[(status, count_key)] / total_count) if total_count else 0
+            pct_row[(status, "OB %")]    = (row[(status, ob_key)]    / total_ob)    if total_ob    else 0
         pct_row[("TOTAL", "TOTAL COUNT %")] = 1 if total_count else 0
-        pct_row[("TOTAL", "TOTAL OB %")] = 1 if total_ob else 0
+        pct_row[("TOTAL", "TOTAL OB %")]    = 1 if total_ob    else 0
         rows.append(pct_row)
 
     pct_df = pd.DataFrame(rows)
     pct_df.columns = pd.MultiIndex.from_tuples(pct_df.columns)
 
-    grand_total_row = summary[summary[("", "Row Labels")].astype(str).str.upper() == "GRAND TOTAL"].iloc[0]
-    grand_total_count = grand_total_row[("TOTAL", "TOTAL COUNT OF CASES")]
-    grand_total_ob = grand_total_row[("TOTAL", "TOTAL OB")]
+    gt = summary[summary[("", "Row Labels")].astype(str).str.upper() == "GRAND TOTAL"].iloc[0]
+    gt_count = gt[("TOTAL", "TOTAL COUNT OF CASES")]
+    gt_ob    = gt[("TOTAL", "TOTAL OB")]
 
-    total_pct_row: Dict[Tuple[str, str], object] = {("", "Row Labels"): "Grand Total"}
+    gt_row: Dict = {("", "Row Labels"): "Grand Total"}
     for status in TABLE_STATUSES:
-        status_count_total = grand_total_row[(status, "COUNT OF ACCOUNT CYCLE")]
-        status_ob_total = grand_total_row[(status, "OB PER CYCLE")]
+        gt_row[(status, "COUNT %")] = (gt[(status, count_key)] / gt_count) if gt_count else 0
+        gt_row[(status, "OB %")]    = (gt[(status, ob_key)]    / gt_ob)    if gt_ob    else 0
+    gt_row[("TOTAL", "TOTAL COUNT %")] = 1 if gt_count else 0
+    gt_row[("TOTAL", "TOTAL OB %")]    = 1 if gt_ob    else 0
 
-        total_pct_row[(status, "COUNT %")] = (
-            status_count_total / grand_total_count if grand_total_count else 0
-        )
-        total_pct_row[(status, "OB %")] = (
-            status_ob_total / grand_total_ob if grand_total_ob else 0
-        )
-
-    total_pct_row[("TOTAL", "TOTAL COUNT %")] = 1 if grand_total_count else 0
-    total_pct_row[("TOTAL", "TOTAL OB %")] = 1 if grand_total_ob else 0
-
-    pct_df = pd.concat([pct_df, pd.DataFrame([total_pct_row])], ignore_index=True)
+    pct_df = pd.concat([pct_df, pd.DataFrame([gt_row])], ignore_index=True)
     return pct_df
 
 
@@ -276,238 +300,263 @@ def to_flat_preview(df: pd.DataFrame) -> pd.DataFrame:
     return preview
 
 
-def to_flat_preview_pct(pct_df: pd.DataFrame) -> pd.DataFrame:
-    preview = pct_df.copy()
-    preview.columns = [
-        sub if top in ("", "TOTAL") else f"{top} - {sub}"
-        for top, sub in preview.columns
-    ]
-    return preview
+# ─────────────────────────────────────────────────────────────────────────────
+#  Excel helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_styles() -> dict:
+    fill_title = PatternFill("solid", fgColor="D9EAD3")
+    fill_red   = PatternFill("solid", fgColor="C00000")
+    fill_white = PatternFill("solid", fgColor="FFFFFF")
+    thin       = Side(style="thin", color="000000")
+    border     = Border(left=thin, right=thin, top=thin, bottom=thin)
+    return dict(
+        fill_title=fill_title, fill_red=fill_red, fill_white=fill_white,
+        border=border,
+        font_title=Font(name="Arial", size=12, bold=True,  color="000000"),
+        font_hdr  =Font(name="Arial", size=10, bold=True,  color="FFFFFF"),
+        font_body =Font(name="Arial", size=10, bold=False, color="000000"),
+        font_total=Font(name="Arial", size=10, bold=True,  color="000000"),
+        center=Alignment(horizontal="center", vertical="center"),
+        left  =Alignment(horizontal="left",   vertical="center"),
+        right =Alignment(horizontal="right",  vertical="center"),
+    )
 
 
-def apply_cell_style(cell, fill, font, alignment, border, number_format=None):
-    cell.fill = fill
-    cell.font = font
+def _apply(cell, fill, font, alignment, border, number_format=None):
+    cell.fill      = fill
+    cell.font      = font
     cell.alignment = alignment
-    cell.border = border
+    cell.border    = border
     if number_format:
         cell.number_format = number_format
 
 
-def build_formatted_excel(summary: pd.DataFrame, pct_df: pd.DataFrame, month_span_label: str) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Table 1"
+def _write_summary_block(ws, summary: pd.DataFrame, title: str,
+                          start_row: int, s: dict, is_sub: bool = False) -> int:
+    """Write a count/OB summary block. Returns next available row."""
+    count_lbl = "NO. OF CASES"        if is_sub else "COUNT OF ACCOUNT CYCLE"
+    ob_lbl    = "OB"                   if is_sub else "OB PER CYCLE"
 
-    fill_title = PatternFill("solid", fgColor="D9EAD3")
-    fill_red = PatternFill("solid", fgColor="C00000")
-    fill_white = PatternFill("solid", fgColor="FFFFFF")
+    # title
+    ws.merge_cells(f"A{start_row}:M{start_row}")
+    ws[f"A{start_row}"] = title
+    _apply(ws[f"A{start_row}"], s["fill_title"], s["font_title"], s["left"], s["border"])
 
-    thin_black = Side(style="thin", color="000000")
-    border = Border(left=thin_black, right=thin_black, top=thin_black, bottom=thin_black)
+    hr1 = start_row + 1
+    hr2 = start_row + 2
 
-    font_title = Font(name="Arial", size=12, bold=True, color="000000")
-    font_header = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-    font_body = Font(name="Arial", size=10, bold=False, color="000000")
-    font_total = Font(name="Arial", size=10, bold=True, color="000000")
+    # header row 1
+    for tag, col in [("A", "A"), ("B", "B"), ("D", "D"), ("F", "F"),
+                     ("H", "H"), ("J", "J"), ("L", "L"), ("M", "M")]:
+        pass  # handled below with merge
 
-    center = Alignment(horizontal="center", vertical="center")
-    left = Alignment(horizontal="left", vertical="center")
-    right = Alignment(horizontal="right", vertical="center")
+    ws.merge_cells(f"A{hr1}:A{hr2}")
+    ws.merge_cells(f"B{hr1}:C{hr1}")
+    ws.merge_cells(f"D{hr1}:E{hr1}")
+    ws.merge_cells(f"F{hr1}:G{hr1}")
+    ws.merge_cells(f"H{hr1}:I{hr1}")
+    ws.merge_cells(f"J{hr1}:K{hr1}")
+    ws.merge_cells(f"L{hr1}:L{hr2}")
+    ws.merge_cells(f"M{hr1}:M{hr2}")
 
-    columns = [
-        ("A", 18),
-        ("B", 16), ("C", 14),
-        ("D", 16), ("E", 14),
-        ("F", 16), ("G", 14),
-        ("H", 16), ("I", 14),
-        ("J", 16), ("K", 14),
-        ("L", 16), ("M", 14),
-    ]
-    for col, width in columns:
-        ws.column_dimensions[col].width = width
+    ws[f"A{hr1}"] = "Row Labels"
+    ws[f"B{hr1}"] = "ALL NEGATIVE"
+    ws[f"D{hr1}"] = "CALL OUTS"
+    ws[f"F{hr1}"] = "EMAIL"
+    ws[f"H{hr1}"] = "FLD VST"
+    ws[f"J{hr1}"] = "SELF CURED"
+    ws[f"L{hr1}"] = "TOTAL COUNT OF CASES"
+    ws[f"M{hr1}"] = "TOTAL OB"
 
-    table1_title = f"OVERALL RESPONSE BY CASES AND BALANCE ({month_span_label})"
-    table2_title = "OVERALL RESPONSE RATE"
-
-    # =========================
-    # TABLE 1
-    # =========================
-    ws.merge_cells("A1:M1")
-    ws["A1"] = table1_title
-    apply_cell_style(ws["A1"], fill_title, font_title, left, border)
-
-    ws.merge_cells("A2:A3")
-    ws.merge_cells("B2:C2")
-    ws.merge_cells("D2:E2")
-    ws.merge_cells("F2:G2")
-    ws.merge_cells("H2:I2")
-    ws.merge_cells("J2:K2")
-    ws.merge_cells("L2:L3")
-    ws.merge_cells("M2:M3")
-
-    ws["A2"] = "Row Labels"
-    ws["B2"] = "ALL NEGATIVE"
-    ws["D2"] = "CALL OUTS"
-    ws["F2"] = "EMAIL"
-    ws["H2"] = "FLD VST"
-    ws["J2"] = "SELF CURED"
-    ws["L2"] = "TOTAL COUNT OF CASES"
-    ws["M2"] = "TOTAL OB"
-
-    for row in ws.iter_rows(min_row=2, max_row=2, min_col=1, max_col=13):
+    for row in ws.iter_rows(min_row=hr1, max_row=hr1, min_col=1, max_col=13):
         for cell in row:
-            apply_cell_style(cell, fill_red, font_header, center, border)
+            _apply(cell, s["fill_red"], s["font_hdr"], s["center"], s["border"])
 
-    sub_headers = [
-        "COUNT OF ACCOUNT CYCLE", "OB PER CYCLE",
-        "COUNT OF ACCOUNT CYCLE", "OB PER CYCLE",
-        "COUNT OF ACCOUNT CYCLE", "OB PER CYCLE",
-        "COUNT OF ACCOUNT CYCLE", "OB PER CYCLE",
-        "COUNT OF ACCOUNT CYCLE", "OB PER CYCLE",
-    ]
-
-    for idx, text in enumerate(sub_headers, start=2):
-        ws.cell(row=3, column=idx, value=text)
-
-    for row in ws.iter_rows(min_row=3, max_row=3, min_col=2, max_col=11):
+    # header row 2
+    for idx, text in enumerate([count_lbl, ob_lbl] * 5, start=2):
+        ws.cell(row=hr2, column=idx, value=text)
+    for row in ws.iter_rows(min_row=hr2, max_row=hr2, min_col=2, max_col=11):
         for cell in row:
-            apply_cell_style(cell, fill_red, font_header, center, border)
+            _apply(cell, s["fill_red"], s["font_hdr"], s["center"], s["border"])
+    ws[f"A{hr2}"].border = s["border"]
+    ws[f"L{hr2}"].border = s["border"]
+    ws[f"M{hr2}"].border = s["border"]
 
-    apply_cell_style(ws["A2"], fill_red, font_header, center, border)
-    ws["A3"].border = border
-    apply_cell_style(ws["L2"], fill_red, font_header, center, border)
-    ws["L3"].border = border
-    apply_cell_style(ws["M2"], fill_red, font_header, center, border)
-    ws["M3"].border = border
+    # data rows
+    count_cols = [2, 4, 6, 8, 10, 12]
+    ob_cols    = [3, 5, 7, 9, 11, 13]
+    data_start = hr2 + 1
 
-    start_row = 4
-    numeric_count_cols = [2, 4, 6, 8, 10, 12]
-    numeric_ob_cols = [3, 5, 7, 9, 11, 13]
-
-    for i, (_, row) in enumerate(summary.iterrows(), start=start_row):
-        row_label = str(row[("", "Row Labels")])
-        is_total = normalize_text(row_label) == "GRAND TOTAL"
-        body_font = font_total if is_total else font_body
+    for i, (_, row) in enumerate(summary.iterrows(), start=data_start):
+        label    = str(row[("", "Row Labels")])
+        is_total = normalize_text(label) == "GRAND TOTAL"
+        bfont    = s["font_total"] if is_total else s["font_body"]
 
         values = [
-            row_label,
-            int(row[("ALL NEGATIVE", "COUNT OF ACCOUNT CYCLE")]),
-            float(row[("ALL NEGATIVE", "OB PER CYCLE")]),
-            int(row[("CALL OUTS", "COUNT OF ACCOUNT CYCLE")]),
-            float(row[("CALL OUTS", "OB PER CYCLE")]),
-            int(row[("EMAIL", "COUNT OF ACCOUNT CYCLE")]),
-            float(row[("EMAIL", "OB PER CYCLE")]),
-            int(row[("FLD VST", "COUNT OF ACCOUNT CYCLE")]),
-            float(row[("FLD VST", "OB PER CYCLE")]),
-            int(row[("SELF CURED", "COUNT OF ACCOUNT CYCLE")]),
-            float(row[("SELF CURED", "OB PER CYCLE")]),
+            label,
+            int(row[("ALL NEGATIVE", count_lbl)]), float(row[("ALL NEGATIVE", ob_lbl)]),
+            int(row[("CALL OUTS",    count_lbl)]), float(row[("CALL OUTS",    ob_lbl)]),
+            int(row[("EMAIL",        count_lbl)]), float(row[("EMAIL",        ob_lbl)]),
+            int(row[("FLD VST",      count_lbl)]), float(row[("FLD VST",      ob_lbl)]),
+            int(row[("SELF CURED",   count_lbl)]), float(row[("SELF CURED",   ob_lbl)]),
             int(row[("TOTAL", "TOTAL COUNT OF CASES")]),
             float(row[("TOTAL", "TOTAL OB")]),
         ]
-
         for col_idx, value in enumerate(values, start=1):
             cell = ws.cell(row=i, column=col_idx, value=value)
-            apply_cell_style(cell, fill_white, body_font, left if col_idx == 1 else right, border)
-
-            if col_idx in numeric_count_cols:
+            _apply(cell, s["fill_white"], bfont,
+                   s["left"] if col_idx == 1 else s["right"], s["border"])
+            if col_idx in count_cols:
                 cell.number_format = "#,##0"
-            elif col_idx in numeric_ob_cols:
+            elif col_idx in ob_cols:
                 cell.number_format = "#,##0"
 
-    # =========================
-    # TABLE 2
-    # =========================
-    gap_row = start_row + len(summary) + 3
-    title_row = gap_row - 1
-    header_top = gap_row
-    header_sub = gap_row + 1
-    data_start = gap_row + 2
+    return data_start + len(summary)
 
-    ws.merge_cells(f"A{title_row}:M{title_row}")
-    ws[f"A{title_row}"] = table2_title
-    apply_cell_style(ws[f"A{title_row}"], fill_title, font_title, left, border)
 
-    ws.merge_cells(f"A{header_top}:A{header_sub}")
-    ws.merge_cells(f"B{header_top}:C{header_top}")
-    ws.merge_cells(f"D{header_top}:E{header_top}")
-    ws.merge_cells(f"F{header_top}:G{header_top}")
-    ws.merge_cells(f"H{header_top}:I{header_top}")
-    ws.merge_cells(f"J{header_top}:K{header_top}")
-    ws.merge_cells(f"L{header_top}:L{header_sub}")
-    ws.merge_cells(f"M{header_top}:M{header_sub}")
+def _write_rate_block(ws, pct_df: pd.DataFrame, title: str,
+                      start_row: int, s: dict) -> int:
+    """Write a percentage/rate block. Returns next available row."""
+    ws.merge_cells(f"A{start_row}:M{start_row}")
+    ws[f"A{start_row}"] = title
+    _apply(ws[f"A{start_row}"], s["fill_title"], s["font_title"], s["left"], s["border"])
 
-    ws[f"A{header_top}"] = "Row Labels"
-    ws[f"B{header_top}"] = "ALL NEGATIVE"
-    ws[f"D{header_top}"] = "CALL OUTS"
-    ws[f"F{header_top}"] = "EMAIL"
-    ws[f"H{header_top}"] = "FLD VST"
-    ws[f"J{header_top}"] = "SELF CURED"
-    ws[f"L{header_top}"] = "TOTAL COUNT %"
-    ws[f"M{header_top}"] = "TOTAL OB %"
+    hr1 = start_row + 1
+    hr2 = start_row + 2
 
-    for row in ws.iter_rows(min_row=header_top, max_row=header_top, min_col=1, max_col=13):
+    ws.merge_cells(f"A{hr1}:A{hr2}")
+    ws.merge_cells(f"B{hr1}:C{hr1}")
+    ws.merge_cells(f"D{hr1}:E{hr1}")
+    ws.merge_cells(f"F{hr1}:G{hr1}")
+    ws.merge_cells(f"H{hr1}:I{hr1}")
+    ws.merge_cells(f"J{hr1}:K{hr1}")
+    ws.merge_cells(f"L{hr1}:L{hr2}")
+    ws.merge_cells(f"M{hr1}:M{hr2}")
+
+    ws[f"A{hr1}"] = "Row Labels"
+    ws[f"B{hr1}"] = "ALL NEGATIVE"
+    ws[f"D{hr1}"] = "CALL OUTS"
+    ws[f"F{hr1}"] = "EMAIL"
+    ws[f"H{hr1}"] = "FLD VST"
+    ws[f"J{hr1}"] = "SELF CURED"
+    ws[f"L{hr1}"] = "TOTAL COUNT %"
+    ws[f"M{hr1}"] = "TOTAL OB %"
+
+    for row in ws.iter_rows(min_row=hr1, max_row=hr1, min_col=1, max_col=13):
         for cell in row:
-            apply_cell_style(cell, fill_red, font_header, center, border)
+            _apply(cell, s["fill_red"], s["font_hdr"], s["center"], s["border"])
 
-    pct_sub_headers = [
-        "COUNT %", "OB %",
-        "COUNT %", "OB %",
-        "COUNT %", "OB %",
-        "COUNT %", "OB %",
-        "COUNT %", "OB %",
-    ]
-
-    for idx, text in enumerate(pct_sub_headers, start=2):
-        ws.cell(row=header_sub, column=idx, value=text)
-
-    for row in ws.iter_rows(min_row=header_sub, max_row=header_sub, min_col=2, max_col=11):
+    for idx, text in enumerate(["COUNT %", "OB %"] * 5, start=2):
+        ws.cell(row=hr2, column=idx, value=text)
+    for row in ws.iter_rows(min_row=hr2, max_row=hr2, min_col=2, max_col=11):
         for cell in row:
-            apply_cell_style(cell, fill_red, font_header, center, border)
+            _apply(cell, s["fill_red"], s["font_hdr"], s["center"], s["border"])
+    ws[f"A{hr2}"].border = s["border"]
+    ws[f"L{hr2}"].border = s["border"]
+    ws[f"M{hr2}"].border = s["border"]
 
-    apply_cell_style(ws[f"A{header_top}"], fill_red, font_header, center, border)
-    ws[f"A{header_sub}"].border = border
-    apply_cell_style(ws[f"L{header_top}"], fill_red, font_header, center, border)
-    ws[f"L{header_sub}"].border = border
-    apply_cell_style(ws[f"M{header_top}"], fill_red, font_header, center, border)
-    ws[f"M{header_sub}"].border = border
-
+    data_start = hr2 + 1
     for i, (_, row) in enumerate(pct_df.iterrows(), start=data_start):
-        row_label = str(row[("", "Row Labels")])
-        is_total = normalize_text(row_label) == "GRAND TOTAL"
-        body_font = font_total if is_total else font_body
+        label    = str(row[("", "Row Labels")])
+        is_total = normalize_text(label) == "GRAND TOTAL"
+        bfont    = s["font_total"] if is_total else s["font_body"]
 
-        label_cell = ws.cell(row=i, column=1, value=row_label)
-        apply_cell_style(label_cell, fill_white, body_font, left, border)
+        ws.cell(row=i, column=1, value=label)
+        _apply(ws.cell(row=i, column=1), s["fill_white"], bfont, s["left"], s["border"])
 
         values = [
-            row[("ALL NEGATIVE", "COUNT %")],
-            row[("ALL NEGATIVE", "OB %")],
-            row[("CALL OUTS", "COUNT %")],
-            row[("CALL OUTS", "OB %")],
-            row[("EMAIL", "COUNT %")],
-            row[("EMAIL", "OB %")],
-            row[("FLD VST", "COUNT %")],
-            row[("FLD VST", "OB %")],
-            row[("SELF CURED", "COUNT %")],
-            row[("SELF CURED", "OB %")],
-            row[("TOTAL", "TOTAL COUNT %")],
-            row[("TOTAL", "TOTAL OB %")],
+            row[("ALL NEGATIVE", "COUNT %")], row[("ALL NEGATIVE", "OB %")],
+            row[("CALL OUTS",    "COUNT %")], row[("CALL OUTS",    "OB %")],
+            row[("EMAIL",        "COUNT %")], row[("EMAIL",        "OB %")],
+            row[("FLD VST",      "COUNT %")], row[("FLD VST",      "OB %")],
+            row[("SELF CURED",   "COUNT %")], row[("SELF CURED",   "OB %")],
+            row[("TOTAL", "TOTAL COUNT %")],  row[("TOTAL", "TOTAL OB %")],
         ]
-
         for col_idx, value in enumerate(values, start=2):
             cell = ws.cell(row=i, column=col_idx, value=float(value))
-            apply_cell_style(cell, fill_white, body_font, right, border, "0%")
+            _apply(cell, s["fill_white"], bfont, s["right"], s["border"], "0%")
 
+    return data_start + len(pct_df)
+
+
+def build_formatted_excel(source_df: pd.DataFrame, month_span_label: str) -> bytes:
+    """
+    One workbook, one sheet ("Dashboard"), stacked vertically:
+      Block 1-2  : Overall summary + rate  (all months)
+      Per month  : Month summary + rate
+                   Month PTP summary + rate
+                   Month CURED summary + rate
+    3-row gap between every block.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Dashboard"
     ws.sheet_view.showGridLines = False
-    ws.row_dimensions[1].height = 22
-    ws.row_dimensions[2].height = 20
-    ws.row_dimensions[3].height = 32
-    ws.row_dimensions[title_row].height = 22
-    ws.row_dimensions[header_top].height = 20
-    ws.row_dimensions[header_sub].height = 20
 
-    # No freeze panes, as requested.
+    for col, width in [
+        ("A", 22), ("B", 16), ("C", 16), ("D", 16), ("E", 16),
+        ("F", 16), ("G", 16), ("H", 16), ("I", 16), ("J", 16),
+        ("K", 16), ("L", 18), ("M", 18),
+    ]:
+        ws.column_dimensions[col].width = width
+
+    s   = _make_styles()
+    cur = 1  # current row pointer
+
+    # ── OVERALL ─────────────────────────────────────────────────────────────
+    overall_summary = build_summary_table(source_df)
+    overall_pct     = build_percentage_table(overall_summary, is_sub=False)
+
+    cur = _write_summary_block(ws, overall_summary,
+        f"OVERALL RESPONSE BY CASES AND BALANCE ({month_span_label})",
+        cur, s, is_sub=False)
+    cur += 3
+    cur = _write_rate_block(ws, overall_pct,
+        "OVERALL RESPONSE RATE", cur, s)
+    cur += 3
+
+    # ── PER MONTH ────────────────────────────────────────────────────────────
+    for month_num in get_detected_months(source_df):
+        month_name   = month_num_to_name(month_num)
+        month_df     = filter_by_cutoff_month(source_df, month_num)
+        ptp_df_raw   = filter_ptp(month_df)
+        cured_df_raw = filter_cured(month_df)
+
+        # Month Overall
+        m_summary = build_summary_table(month_df)
+        m_pct     = build_percentage_table(m_summary, is_sub=False)
+        cur = _write_summary_block(ws, m_summary,
+            f"{month_name} RESPONSE BY CASES AND BALANCE",
+            cur, s, is_sub=False)
+        cur += 3
+        cur = _write_rate_block(ws, m_pct,
+            f"{month_name} OVERALL RESPONSE RATE", cur, s)
+        cur += 3
+
+        # Month PTP
+        if not ptp_df_raw.empty:
+            ptp_summary = build_sub_summary_table(ptp_df_raw)
+            ptp_pct     = build_percentage_table(ptp_summary, is_sub=True)
+            cur = _write_summary_block(ws, ptp_summary,
+                f"{month_name} RESPONSE BY CASES AND BALANCE - PTP",
+                cur, s, is_sub=True)
+            cur += 3
+            cur = _write_rate_block(ws, ptp_pct,
+                f"{month_name} OVERALL RESPONSE RATE - PTP", cur, s)
+            cur += 3
+
+        # Month CURED
+        if not cured_df_raw.empty:
+            cured_summary = build_sub_summary_table(cured_df_raw)
+            cured_pct     = build_percentage_table(cured_summary, is_sub=True)
+            cur = _write_summary_block(ws, cured_summary,
+                f"{month_name} RESPONSE BY CASES AND BALANCE - CURED",
+                cur, s, is_sub=True)
+            cur += 3
+            cur = _write_rate_block(ws, cured_pct,
+                f"{month_name} OVERALL RESPONSE RATE - CURED", cur, s)
+            cur += 3
 
     output = io.BytesIO()
     wb.save(output)
@@ -515,8 +564,15 @@ def build_formatted_excel(summary: pd.DataFrame, pct_df: pd.DataFrame, month_spa
     return output.getvalue()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Streamlit UI
+# ─────────────────────────────────────────────────────────────────────────────
+
 st.title("BPI Project Dashboard Automation")
-st.caption("Table 1 and Table 2 use all months found in CUT OFF MONTH")
+st.caption(
+    "Overall tables (all months) + per-month Summary & Rate tables "
+    "for Overall, PTP, and CURED — all in one Excel sheet."
+)
 
 uploaded_file = st.file_uploader("Upload your Excel file (.xlsx)", type=["xlsx"])
 
@@ -533,52 +589,96 @@ except Exception as exc:
     st.stop()
 
 sheet_name = st.selectbox("Select source sheet", options=list(workbook.keys()), index=0)
-source_df = workbook[sheet_name]
+source_df  = workbook[sheet_name]
 
 with st.expander("Preview source data", expanded=False):
     st.dataframe(source_df.head(20), use_container_width=True)
 
 try:
     month_span_label = get_month_span_label(source_df)
-    summary = build_summary_table(source_df)
-    pct_df = build_percentage_table(summary)
+    detected_months  = get_detected_months(source_df)
 except Exception as exc:
-    st.error(f"Unable to build the tables: {exc}")
+    st.error(f"Unable to parse month data: {exc}")
     st.stop()
 
-st.subheader("Table 1 Preview")
-st.dataframe(to_flat_preview(summary), use_container_width=True, hide_index=True)
-
-st.subheader("Table 2 Preview")
-st.dataframe(to_flat_preview(pct_df), use_container_width=True, hide_index=True)
-
 st.info(
-    f"Detected CUT OFF MONTH range for overall tables: {month_span_label}. "
-    f"These first two tables use all rows in the uploaded file."
+    f"Detected months: **{', '.join(month_num_to_name(m) for m in detected_months)}** "
+    f"({month_span_label})"
 )
 
-# Generate Table 3 and Table 4 for each month (January, February, March, etc.)
-for month_num in range(1, 13):
-    filtered_data = filter_by_cutoff_month(source_df, month_num)
-    if not filtered_data.empty:
-        month_name = month_num_to_name(month_num)
-        st.subheader(f"Table 3 - {month_name} - Summary")
-        month_summary = build_summary_table(filtered_data)
-        st.dataframe(to_flat_preview(month_summary), use_container_width=True, hide_index=True)
+# ── Overall previews ──────────────────────────────────────────────────────────
+try:
+    overall_summary = build_summary_table(source_df)
+    overall_pct     = build_percentage_table(overall_summary, is_sub=False)
+except Exception as exc:
+    st.error(f"Unable to build overall tables: {exc}")
+    st.stop()
 
-        st.subheader(f"Table 4 - {month_name} - Percentage")
-        month_pct_df = build_percentage_table(month_summary)
-        st.dataframe(to_flat_preview_pct(month_pct_df), use_container_width=True, hide_index=True)
+st.subheader(f"Table 1 — Overall Response by Cases and Balance ({month_span_label})")
+st.dataframe(to_flat_preview(overall_summary), use_container_width=True, hide_index=True)
 
+st.subheader("Table 2 — Overall Response Rate")
+st.dataframe(to_flat_preview(overall_pct), use_container_width=True, hide_index=True)
+
+# ── Per-month previews ────────────────────────────────────────────────────────
+for month_num in detected_months:
+    month_name   = month_num_to_name(month_num)
+    month_df     = filter_by_cutoff_month(source_df, month_num)
+    ptp_df_raw   = filter_ptp(month_df)
+    cured_df_raw = filter_cured(month_df)
+
+    st.markdown(f"---\n### {month_name}")
+
+    # Overall
+    try:
+        m_summary = build_summary_table(month_df)
+        m_pct     = build_percentage_table(m_summary, is_sub=False)
+        st.subheader(f"Table 3 — {month_name} Response by Cases and Balance")
+        st.dataframe(to_flat_preview(m_summary), use_container_width=True, hide_index=True)
+        st.subheader(f"Table 4 — {month_name} Overall Response Rate")
+        st.dataframe(to_flat_preview(m_pct), use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.error(f"Error building {month_name} overall tables: {exc}")
+
+    # PTP
+    if not ptp_df_raw.empty:
         try:
-            excel_bytes = build_formatted_excel(month_summary, month_pct_df, month_name)
+            ptp_summary = build_sub_summary_table(ptp_df_raw)
+            ptp_pct     = build_percentage_table(ptp_summary, is_sub=True)
+            st.subheader(f"Table 5 — {month_name} Response by Cases and Balance - PTP")
+            st.dataframe(to_flat_preview(ptp_summary), use_container_width=True, hide_index=True)
+            st.subheader(f"Table 6 — {month_name} Overall Response Rate - PTP")
+            st.dataframe(to_flat_preview(ptp_pct), use_container_width=True, hide_index=True)
         except Exception as exc:
-            st.error(f"Unable to format the Excel output file for {month_name}: {exc}")
-            continue
+            st.error(f"Error building {month_name} PTP tables: {exc}")
+    else:
+        st.caption(f"No PTP data found for {month_name}.")
 
-        st.download_button(
-            label=f"Download {month_name} formatted Excel",
-            data=excel_bytes,
-            file_name=f"{month_name}_table3_table4_formatted_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    # CURED
+    if not cured_df_raw.empty:
+        try:
+            cured_summary = build_sub_summary_table(cured_df_raw)
+            cured_pct     = build_percentage_table(cured_summary, is_sub=True)
+            st.subheader(f"Table 7 — {month_name} Response by Cases and Balance - CURED")
+            st.dataframe(to_flat_preview(cured_summary), use_container_width=True, hide_index=True)
+            st.subheader(f"Table 8 — {month_name} Overall Response Rate - CURED")
+            st.dataframe(to_flat_preview(cured_pct), use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.error(f"Error building {month_name} CURED tables: {exc}")
+    else:
+        st.caption(f"No CURED data found for {month_name}.")
+
+# ── Download ──────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("Download All Tables")
+
+try:
+    excel_bytes = build_formatted_excel(source_df, month_span_label)
+    st.download_button(
+        label="⬇️ Download Full Formatted Excel (All Tables — One Sheet)",
+        data=excel_bytes,
+        file_name="BPI_Dashboard_All_Tables.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+except Exception as exc:
+    st.error(f"Unable to generate Excel file: {exc}")
