@@ -1,11 +1,13 @@
 import io
 import re
 import calendar
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart.label import DataLabelList
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -40,21 +42,15 @@ STATUS_ALIASES = {
     "SELF-CURED": "SELF CURED",
 }
 
-# ── Column layout constants (1-based Excel column numbers) ────────────────────
-#  Overall  : cols  1–13  (A–M)
-#  gap      : col  14     (N)
-#  PTP      : cols 15–27  (O–AA)
-#  gap      : col  28     (AB)
-#  CURED    : cols 29–41  (AC–AO)
-
-OVERALL_START = 1   # col A
-PTP_START     = 15  # col O
-CURED_START   = 29  # col AC
-BLOCK_WIDTH   = 13  # 13 columns per table (label + total×2 + 5×2)
+# Dashboard layout
+OVERALL_START = 1
+PTP_START     = 15
+CURED_START   = 29
+BLOCK_WIDTH   = 13
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Data helpers
+# Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_text(value: object) -> str:
@@ -72,7 +68,7 @@ def resolve_column(
     df: pd.DataFrame,
     *,
     by_name: Optional[str] = None,
-    by_excel_index: Optional[int] = None
+    by_excel_index: Optional[int] = None,
 ) -> str:
     if by_name:
         target = normalize_text(by_name)
@@ -104,14 +100,18 @@ def extract_month_number(value: object) -> Optional[int]:
             return int(dt.month)
     except Exception:
         pass
+
     text = normalize_text(value)
     if not text:
         return None
+
     if text in MONTH_NAME_TO_NUM:
         return MONTH_NAME_TO_NUM[text]
+
     for name, num in MONTH_NAME_TO_NUM.items():
         if re.search(rf"\b{name}\b", text):
             return num
+
     m = re.fullmatch(r"(\d{1,2})(?:\.0+)?", text)
     if m:
         n = int(m.group(1))
@@ -160,10 +160,15 @@ def filter_cured(df: pd.DataFrame) -> pd.DataFrame:
     return df[df[col].apply(normalize_text) == "CURED"].copy()
 
 
+def _cycle_sort_key(value: object) -> Tuple[float, str]:
+    text = str(value).strip()
+    m = re.search(r"(\d+)", text)
+    if m:
+        return (float(m.group(1)), text)
+    return (float("inf"), text)
+
+
 def _build_table(df: pd.DataFrame, is_sub: bool) -> pd.DataFrame:
-    """
-    Core aggregation. is_sub=True uses NO. OF CASES / OB labels (PTP/CURED).
-    """
     cycle_col   = resolve_column(df, by_name="CYCLE",                    by_excel_index=2)
     ob_col      = resolve_column(df, by_name="OB",                       by_excel_index=5)
     contact_col = resolve_column(df, by_name="CONTACT SOURCE (OVERALL)", by_excel_index=55)
@@ -207,6 +212,7 @@ def _build_table(df: pd.DataFrame, is_sub: bool) -> pd.DataFrame:
         ("TOTAL", "TOTAL COUNT OF CASES"): tbl[("TOTAL", "TOTAL COUNT OF CASES")].sum(),
         ("TOTAL", "TOTAL OB"): tbl[("TOTAL", "TOTAL OB")].sum(),
     }
+
     for col in tbl.columns:
         if col not in [("", "Cycle"), ("TOTAL", "TOTAL COUNT OF CASES"), ("TOTAL", "TOTAL OB")]:
             gt[col] = tbl[col].sum()
@@ -275,39 +281,87 @@ def to_flat_preview(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Excel formatting
+# Variance helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_status_count_map(summary: Optional[pd.DataFrame], status: str) -> Dict[str, int]:
+    if summary is None or summary.empty:
+        return {}
+
+    detail = summary[summary[("", "Cycle")].astype(str).str.upper() != "GRAND TOTAL"].copy()
+    out: Dict[str, int] = {}
+
+    for _, row in detail.iterrows():
+        cycle = str(row[("", "Cycle")])
+        out[cycle] = int(row[(status, "NO. OF CASES")])
+
+    return out
+
+
+def build_variance_rows(
+    ptp_summary: Optional[pd.DataFrame],
+    cured_summary: Optional[pd.DataFrame],
+    status: str,
+) -> List[List[object]]:
+    """
+    Variance = CURED Count - PTP Count
+    Positive => CURED higher
+    Negative => PTP higher
+    """
+    ptp_map = _extract_status_count_map(ptp_summary, status)
+    cured_map = _extract_status_count_map(cured_summary, status)
+
+    cycles = sorted(set(ptp_map) | set(cured_map), key=_cycle_sort_key)
+
+    rows: List[List[object]] = []
+    for cycle in cycles:
+        ptp_count = int(ptp_map.get(cycle, 0))
+        cured_count = int(cured_map.get(cycle, 0))
+        variance = cured_count - ptp_count
+        rows.append([cycle, ptp_count, cured_count, variance])
+
+    return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel styles/helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_styles() -> dict:
     thin = Side(style="thin", color="000000")
     return dict(
         fill_title=PatternFill("solid", fgColor="D9EAD3"),
-        fill_red  =PatternFill("solid", fgColor="C00000"),
+        fill_red=PatternFill("solid", fgColor="C00000"),
         fill_white=PatternFill("solid", fgColor="FFFFFF"),
-        border    =Border(left=thin, right=thin, top=thin, bottom=thin),
-        font_title=Font(name="Arial", size=12, bold=True,  color="000000"),
-        font_hdr  =Font(name="Arial", size=10, bold=True,  color="FFFFFF"),
-        font_body =Font(name="Arial", size=10, bold=False, color="000000"),
-        font_total=Font(name="Arial", size=10, bold=True,  color="000000"),
+        fill_green=PatternFill("solid", fgColor="C6EFCE"),
+        fill_yellow=PatternFill("solid", fgColor="FFF2CC"),
+        border=Border(left=thin, right=thin, top=thin, bottom=thin),
+        font_title=Font(name="Arial", size=12, bold=True, color="000000"),
+        font_hdr=Font(name="Arial", size=10, bold=True, color="FFFFFF"),
+        font_body=Font(name="Arial", size=10, bold=False, color="000000"),
+        font_total=Font(name="Arial", size=10, bold=True, color="000000"),
         center=Alignment(horizontal="center", vertical="center"),
-        left  =Alignment(horizontal="left",   vertical="center"),
-        right =Alignment(horizontal="right",  vertical="center"),
+        left=Alignment(horizontal="left", vertical="center"),
+        right=Alignment(horizontal="right", vertical="center"),
     )
 
 
 def _apply(cell, fill, font, alignment, border, number_format=None):
-    cell.fill      = fill
-    cell.font      = font
+    cell.fill = fill
+    cell.font = font
     cell.alignment = alignment
-    cell.border    = border
+    cell.border = border
     if number_format:
         cell.number_format = number_format
 
 
 def _col(n: int) -> str:
-    """1-based column number → Excel letter (e.g. 1→A, 15→O, 29→AC)."""
     return get_column_letter(n)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard writing
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _write_summary_side_by_side(
     ws,
@@ -320,11 +374,6 @@ def _write_summary_side_by_side(
     start_row: int,
     s: dict,
 ) -> int:
-    """
-    Write three summary tables side-by-side on the same rows.
-    Overall → cols 1-13, PTP → cols 15-27, CURED → cols 29-41.
-    Returns next available row after all three tables.
-    """
     tables = [
         (overall_summary, overall_title, OVERALL_START, False),
         (ptp_summary,     ptp_title,     PTP_START,     True),
@@ -340,20 +389,16 @@ def _write_summary_side_by_side(
         ob_lbl    = "OB"           if is_sub else "OB PER CYCLE"
         c         = col_start
 
-        # title
         title_start = _col(c)
         title_end   = _col(c + BLOCK_WIDTH - 1)
         ws.merge_cells(f"{title_start}{start_row}:{title_end}{start_row}")
         ws[f"{title_start}{start_row}"] = title
-        _apply(
-            ws[f"{title_start}{start_row}"],
-            s["fill_title"], s["font_title"], s["left"], s["border"]
-        )
+        _apply(ws[f"{title_start}{start_row}"],
+               s["fill_title"], s["font_title"], s["left"], s["border"])
 
         hr1 = start_row + 1
         hr2 = start_row + 2
 
-        # header row 1 merges
         ws.merge_cells(f"{_col(c)}{hr1}:{_col(c)}{hr2}")
         ws.merge_cells(f"{_col(c+1)}{hr1}:{_col(c+1)}{hr2}")
         ws.merge_cells(f"{_col(c+2)}{hr1}:{_col(c+2)}{hr2}")
@@ -372,21 +417,15 @@ def _write_summary_side_by_side(
         ws.cell(hr1, c+9,  "FLD VST")
         ws.cell(hr1, c+11, "SELF CURED")
 
-        for cell in ws.iter_rows(
-            min_row=hr1, max_row=hr1,
-            min_col=c, max_col=c+12, values_only=False
-        ):
+        for cell in ws.iter_rows(min_row=hr1, max_row=hr1,
+                                  min_col=c, max_col=c+12, values_only=False):
             for cl in cell:
                 _apply(cl, s["fill_red"], s["font_hdr"], s["center"], s["border"])
 
-        # header row 2 sub-headers (statuses only)
         for offset, text in enumerate([count_lbl, ob_lbl] * 5, start=3):
             ws.cell(hr2, c + offset, text)
-
-        for cell in ws.iter_rows(
-            min_row=hr2, max_row=hr2,
-            min_col=c+3, max_col=c+12, values_only=False
-        ):
+        for cell in ws.iter_rows(min_row=hr2, max_row=hr2,
+                                  min_col=c+3, max_col=c+12, values_only=False):
             for cl in cell:
                 _apply(cl, s["fill_red"], s["font_hdr"], s["center"], s["border"])
 
@@ -394,7 +433,6 @@ def _write_summary_side_by_side(
         ws.cell(hr2, c+1).border  = s["border"]
         ws.cell(hr2, c+2).border  = s["border"]
 
-        # data rows
         count_offsets = [1, 3, 5, 7, 9, 11]
         ob_offsets    = [2, 4, 6, 8, 10, 12]
         data_start    = hr2 + 1
@@ -414,14 +452,10 @@ def _write_summary_side_by_side(
                 int(row[("FLD VST",      count_lbl)]), float(row[("FLD VST",      ob_lbl)]),
                 int(row[("SELF CURED",   count_lbl)]), float(row[("SELF CURED",   ob_lbl)]),
             ]
-
             for offset, value in enumerate(values):
                 cl = ws.cell(i, c + offset, value)
-                _apply(
-                    cl, s["fill_white"], bfont,
-                    s["left"] if offset == 0 else s["right"],
-                    s["border"]
-                )
+                _apply(cl, s["fill_white"], bfont,
+                       s["left"] if offset == 0 else s["right"], s["border"])
                 if offset in count_offsets:
                     cl.number_format = "#,##0"
                 elif offset in ob_offsets:
@@ -443,10 +477,6 @@ def _write_rate_side_by_side(
     start_row: int,
     s: dict,
 ) -> int:
-    """
-    Write three rate tables side-by-side on the same rows.
-    Returns next available row.
-    """
     tables = [
         (overall_pct, overall_title, OVERALL_START),
         (ptp_pct,     ptp_title,     PTP_START),
@@ -457,16 +487,12 @@ def _write_rate_side_by_side(
     for tbl, title, col_start in tables:
         if tbl is None:
             continue
-
         c = col_start
 
-        # title
         ws.merge_cells(f"{_col(c)}{start_row}:{_col(c+12)}{start_row}")
         ws[f"{_col(c)}{start_row}"] = title
-        _apply(
-            ws[f"{_col(c)}{start_row}"],
-            s["fill_title"], s["font_title"], s["left"], s["border"]
-        )
+        _apply(ws[f"{_col(c)}{start_row}"],
+               s["fill_title"], s["font_title"], s["left"], s["border"])
 
         hr1 = start_row + 1
         hr2 = start_row + 2
@@ -489,20 +515,15 @@ def _write_rate_side_by_side(
         ws.cell(hr1, c+9,  "FLD VST")
         ws.cell(hr1, c+11, "SELF CURED")
 
-        for cell in ws.iter_rows(
-            min_row=hr1, max_row=hr1,
-            min_col=c, max_col=c+12, values_only=False
-        ):
+        for cell in ws.iter_rows(min_row=hr1, max_row=hr1,
+                                  min_col=c, max_col=c+12, values_only=False):
             for cl in cell:
                 _apply(cl, s["fill_red"], s["font_hdr"], s["center"], s["border"])
 
         for offset, text in enumerate(["COUNT %", "OB %"] * 5, start=3):
             ws.cell(hr2, c + offset, text)
-
-        for cell in ws.iter_rows(
-            min_row=hr2, max_row=hr2,
-            min_col=c+3, max_col=c+12, values_only=False
-        ):
+        for cell in ws.iter_rows(min_row=hr2, max_row=hr2,
+                                  min_col=c+3, max_col=c+12, values_only=False):
             for cl in cell:
                 _apply(cl, s["fill_red"], s["font_hdr"], s["center"], s["border"])
 
@@ -527,7 +548,6 @@ def _write_rate_side_by_side(
                 row[("FLD VST",      "COUNT %")], row[("FLD VST",      "OB %")],
                 row[("SELF CURED",   "COUNT %")], row[("SELF CURED",   "OB %")],
             ]
-
             for offset, value in enumerate(values, start=1):
                 cl = ws.cell(i, c + offset, float(value))
                 _apply(cl, s["fill_white"], bfont, s["right"], s["border"], "0%")
@@ -537,32 +557,552 @@ def _write_rate_side_by_side(
     return start_row + 3 + max_data_rows
 
 
-def build_formatted_excel(source_df: pd.DataFrame, month_span_label: str) -> bytes:
-    """
-    One workbook, one sheet ("Dashboard"):
-      Row group 1: Overall summary (3 side-by-side) + Overall rate (3 side-by-side)
-      Per month  : Month summary (3 side-by-side) + Month rate (3 side-by-side)
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Layout per row group:
-      Col  1-13  = Overall / Month Overall
-      Col 15-27  = PTP
-      Col 29-41  = CURED
+def _extract_status_chart_rows(
+    summary: Optional[pd.DataFrame],
+    status: str,
+    is_sub: bool,
+) -> List[List[object]]:
+    if summary is None:
+        return []
+
+    count_key = "NO. OF CASES" if is_sub else "COUNT OF ACCOUNT CYCLE"
+    ob_key    = "OB"           if is_sub else "OB PER CYCLE"
+
+    detail = summary[summary[("", "Cycle")].astype(str).str.upper() != "GRAND TOTAL"].copy()
+
+    rows: List[List[object]] = []
+    for _, row in detail.iterrows():
+        rows.append([
+            str(row[("", "Cycle")]),
+            int(row[(status, count_key)]),
+            float(row[(status, ob_key)]),
+        ])
+    return rows
+
+
+def _add_combo_chart(
+    ws,
+    title: str,
+    table_col_start: int,
+    header_row: int,
+    data_start_row: int,
+    data_end_row: int,
+    anchor: str,
+):
     """
+    Bigger regular chart:
+    - Cycle labels below the bars
+    - Count inside the bars
+    - OB as yellow line
+    """
+    cats = Reference(
+        ws,
+        min_col=table_col_start,
+        max_col=table_col_start,
+        min_row=data_start_row,
+        max_row=data_end_row,
+    )
+
+    count_data = Reference(
+        ws,
+        min_col=table_col_start + 1,
+        max_col=table_col_start + 1,
+        min_row=header_row,
+        max_row=data_end_row,
+    )
+
+    ob_data = Reference(
+        ws,
+        min_col=table_col_start + 2,
+        max_col=table_col_start + 2,
+        min_row=header_row,
+        max_row=data_end_row,
+    )
+
+    bar = BarChart()
+    bar.type = "col"
+    bar.style = 10
+    bar.title = title
+    bar.y_axis.title = "Count"
+
+    # CHANGED: bigger chart size
+    bar.height = 10.5
+    bar.width = 13.5
+
+    bar.gapWidth = 60
+    bar.legend.position = "r"
+    bar.x_axis.tickLblPos = "nextTo"
+    bar.x_axis.delete = False
+
+    try:
+        bar.x_axis.noMultiLvlLbl = True
+    except Exception:
+        pass
+
+    bar.add_data(count_data, titles_from_data=True)
+    bar.set_categories(cats)
+
+    bar.dLbls = DataLabelList()
+    bar.dLbls.showVal = True
+    bar.dLbls.showCatName = False
+    bar.dLbls.showSerName = False
+    bar.dLbls.showLegendKey = False
+    try:
+        bar.dLbls.position = "ctr"
+    except Exception:
+        pass
+
+    if bar.ser:
+        bar.ser[0].graphicalProperties.solidFill = "FF0000"
+        bar.ser[0].graphicalProperties.line.solidFill = "FF0000"
+
+    line = LineChart()
+    line.y_axis.title = "OB"
+    line.y_axis.axId = 200
+    line.y_axis.crosses = "max"
+
+    # CHANGED: match bigger chart size
+    line.height = 10.5
+    line.width = 13.5
+
+    line.add_data(ob_data, titles_from_data=True)
+
+    try:
+        line.set_categories(cats)
+    except Exception:
+        pass
+
+    if line.ser:
+        line.ser[0].graphicalProperties.line.solidFill = "FFFF00"
+        line.ser[0].graphicalProperties.line.width = 28575
+
+    bar += line
+    ws.add_chart(bar, anchor)
+
+
+def _add_variance_chart(
+    ws,
+    title: str,
+    table_col_start: int,
+    header_row: int,
+    data_start_row: int,
+    data_end_row: int,
+    anchor: str,
+):
+    """
+    Bigger variance chart:
+    Variance = CURED Count - PTP Count
+    Bars red
+    Labels show Cycle and Variance value
+    """
+    chart = BarChart()
+    chart.type = "bar"
+    chart.style = 10
+    chart.title = title
+
+    # CHANGED: bigger chart size
+    chart.height = 10.5
+    chart.width = 13.5
+
+    chart.gapWidth = 35
+    chart.legend = None
+    chart.x_axis.title = "Variance Count (CURED - PTP)"
+    chart.y_axis.title = "Cycle"
+
+    try:
+        chart.y_axis.reverseOrder = True
+    except Exception:
+        pass
+
+    data = Reference(
+        ws,
+        min_col=table_col_start + 3,
+        max_col=table_col_start + 3,
+        min_row=header_row,
+        max_row=data_end_row,
+    )
+    cats = Reference(
+        ws,
+        min_col=table_col_start,
+        max_col=table_col_start,
+        min_row=data_start_row,
+        max_row=data_end_row,
+    )
+
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+
+    chart.dLbls = DataLabelList()
+    chart.dLbls.showVal = True
+    chart.dLbls.showCatName = True
+    chart.dLbls.showSerName = False
+    chart.dLbls.showLegendKey = False
+    try:
+        chart.dLbls.position = "outEnd"
+    except Exception:
+        pass
+
+    if chart.ser:
+        chart.ser[0].graphicalProperties.solidFill = "FF0000"
+        chart.ser[0].graphicalProperties.line.solidFill = "FF0000"
+
+    ws.add_chart(chart, anchor)
+
+
+def _write_chart_block_at(
+    ws,
+    block_title: str,
+    chart_title: str,
+    rows: List[List[object]],
+    start_row: int,
+    table_col_start: int,
+    chart_anchor: str,
+    s: dict,
+) -> None:
+    title_start_col = table_col_start
+    title_end_col = table_col_start + 2
+
+    ws.merge_cells(f"{_col(title_start_col)}{start_row}:{_col(title_end_col)}{start_row}")
+    ws.cell(start_row, title_start_col, block_title)
+    _apply(ws.cell(start_row, title_start_col), s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    header_row = start_row + 1
+    ws.cell(header_row, table_col_start,     "Cycle")
+    ws.cell(header_row, table_col_start + 1, "Count")
+    ws.cell(header_row, table_col_start + 2, "OB")
+
+    for cell in ws.iter_rows(
+        min_row=header_row, max_row=header_row,
+        min_col=table_col_start, max_col=table_col_start + 2,
+        values_only=False
+    ):
+        for cl in cell:
+            _apply(cl, s["fill_red"], s["font_hdr"], s["center"], s["border"])
+
+    data_start_row = header_row + 1
+
+    if rows:
+        for i, (cycle, count, ob) in enumerate(rows, start=data_start_row):
+            c1 = ws.cell(i, table_col_start, cycle)
+            c2 = ws.cell(i, table_col_start + 1, count)
+            c3 = ws.cell(i, table_col_start + 2, ob)
+
+            _apply(c1, s["fill_white"], s["font_body"], s["left"],  s["border"])
+            _apply(c2, s["fill_white"], s["font_body"], s["right"], s["border"])
+            _apply(c3, s["fill_white"], s["font_body"], s["right"], s["border"])
+
+            c2.number_format = "#,##0"
+            c3.number_format = "#,##0"
+
+        data_end_row = data_start_row + len(rows) - 1
+    else:
+        data_end_row = data_start_row
+        c1 = ws.cell(data_start_row, table_col_start, "No data")
+        c2 = ws.cell(data_start_row, table_col_start + 1, 0)
+        c3 = ws.cell(data_start_row, table_col_start + 2, 0)
+
+        _apply(c1, s["fill_white"], s["font_body"], s["left"],  s["border"])
+        _apply(c2, s["fill_white"], s["font_body"], s["right"], s["border"])
+        _apply(c3, s["fill_white"], s["font_body"], s["right"], s["border"])
+
+        c2.number_format = "#,##0"
+        c3.number_format = "#,##0"
+
+    _add_combo_chart(
+        ws=ws,
+        title=chart_title,
+        table_col_start=table_col_start,
+        header_row=header_row,
+        data_start_row=data_start_row,
+        data_end_row=data_end_row,
+        anchor=chart_anchor,
+    )
+
+
+def _write_variance_block_at(
+    ws,
+    block_title: str,
+    chart_title: str,
+    rows: List[List[object]],
+    start_row: int,
+    table_col_start: int,
+    chart_anchor: str,
+    s: dict,
+) -> None:
+    title_start_col = table_col_start
+    title_end_col = table_col_start + 3
+
+    ws.merge_cells(f"{_col(title_start_col)}{start_row}:{_col(title_end_col)}{start_row}")
+    ws.cell(start_row, title_start_col, block_title)
+    _apply(ws.cell(start_row, title_start_col), s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    header_row = start_row + 1
+    headers = ["Cycle", "PTP Count", "CURED Count", "Variance"]
+    for idx, hdr in enumerate(headers):
+        ws.cell(header_row, table_col_start + idx, hdr)
+
+    for cell in ws.iter_rows(
+        min_row=header_row, max_row=header_row,
+        min_col=table_col_start, max_col=table_col_start + 3,
+        values_only=False
+    ):
+        for cl in cell:
+            _apply(cl, s["fill_red"], s["font_hdr"], s["center"], s["border"])
+
+    data_start_row = header_row + 1
+
+    if rows:
+        for i, (cycle, ptp_count, cured_count, variance) in enumerate(rows, start=data_start_row):
+            values = [cycle, ptp_count, cured_count, variance]
+            for offset, value in enumerate(values):
+                cl = ws.cell(i, table_col_start + offset, value)
+
+                if offset == 0:
+                    _apply(cl, s["fill_white"], s["font_body"], s["left"], s["border"])
+                else:
+                    fill = s["fill_white"]
+                    if offset == 3 and variance > 0:
+                        fill = s["fill_green"]
+                    elif offset == 3 and variance < 0:
+                        fill = s["fill_yellow"]
+
+                    _apply(cl, fill, s["font_body"], s["right"], s["border"])
+
+                if offset >= 1:
+                    if offset == 3:
+                        cl.number_format = '#,##0;[Red]-#,##0'
+                    else:
+                        cl.number_format = '#,##0'
+
+        data_end_row = data_start_row + len(rows) - 1
+    else:
+        data_end_row = data_start_row
+        default_vals = ["No data", 0, 0, 0]
+        for offset, value in enumerate(default_vals):
+            cl = ws.cell(data_start_row, table_col_start + offset, value)
+            _apply(
+                cl,
+                s["fill_white"],
+                s["font_body"],
+                s["left"] if offset == 0 else s["right"],
+                s["border"]
+            )
+            if offset >= 1:
+                cl.number_format = '#,##0;[Red]-#,##0'
+
+    _add_variance_chart(
+        ws=ws,
+        title=chart_title,
+        table_col_start=table_col_start,
+        header_row=header_row,
+        data_start_row=data_start_row,
+        data_end_row=data_end_row,
+        anchor=chart_anchor,
+    )
+
+
+def _write_status_row_four_groups(
+    ws,
+    month_label: str,
+    status: str,
+    overall_summary: Optional[pd.DataFrame],
+    ptp_summary: Optional[pd.DataFrame],
+    cured_summary: Optional[pd.DataFrame],
+    start_row: int,
+    s: dict,
+) -> int:
+    overall_rows = _extract_status_chart_rows(overall_summary, status, is_sub=False)
+    ptp_rows     = _extract_status_chart_rows(ptp_summary, status, is_sub=True)
+    cured_rows   = _extract_status_chart_rows(cured_summary, status, is_sub=True)
+    variance_rows = build_variance_rows(ptp_summary, cured_summary, status)
+
+    # CHANGED: more vertical room for bigger charts
+    block_height = max(
+        max(len(overall_rows), len(ptp_rows), len(cured_rows), len(variance_rows)) + 8,
+        24
+    )
+
+    _write_chart_block_at(
+        ws=ws,
+        block_title=f"OVERALL - {status}",
+        chart_title=f"{month_label} - OVERALL - {status}",
+        rows=overall_rows,
+        start_row=start_row,
+        table_col_start=1,
+        chart_anchor=f"E{start_row}",
+        s=s,
+    )
+
+    _write_chart_block_at(
+        ws=ws,
+        block_title=f"PTP - {status}",
+        chart_title=f"{month_label} - PTP - {status}",
+        rows=ptp_rows,
+        start_row=start_row,
+        table_col_start=14,
+        chart_anchor=f"R{start_row}",
+        s=s,
+    )
+
+    _write_chart_block_at(
+        ws=ws,
+        block_title=f"CURED - {status}",
+        chart_title=f"{month_label} - CURED - {status}",
+        rows=cured_rows,
+        start_row=start_row,
+        table_col_start=27,
+        chart_anchor=f"AE{start_row}",
+        s=s,
+    )
+
+    _write_variance_block_at(
+        ws=ws,
+        block_title=f"VARIANCE - {status}",
+        chart_title=f"{month_label} - VARIANCE - {status}",
+        rows=variance_rows,
+        start_row=start_row,
+        table_col_start=40,
+        chart_anchor=f"AS{start_row}",
+        s=s,
+    )
+
+    return start_row + block_height + 2
+
+
+def _write_month_chart_section(
+    ws,
+    month_label: str,
+    overall_summary: Optional[pd.DataFrame],
+    ptp_summary: Optional[pd.DataFrame],
+    cured_summary: Optional[pd.DataFrame],
+    start_row: int,
+    s: dict,
+) -> int:
+    ws.merge_cells(f"A{start_row}:BC{start_row}")
+    ws[f"A{start_row}"] = f"{month_label} CHARTS"
+    _apply(ws[f"A{start_row}"], s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    group_row = start_row + 2
+
+    ws.merge_cells(f"A{group_row}:M{group_row}")
+    ws[f"A{group_row}"] = f"{month_label} - OVERALL RESPONSE BY CASES AND BALANCE"
+    _apply(ws[f"A{group_row}"], s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    ws.merge_cells(f"N{group_row}:Z{group_row}")
+    ws[f"N{group_row}"] = f"{month_label} - OVERALL RESPONSE BY CASES AND BALANCE - PTP"
+    _apply(ws[f"N{group_row}"], s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    ws.merge_cells(f"AA{group_row}:AM{group_row}")
+    ws[f"AA{group_row}"] = f"{month_label} - OVERALL RESPONSE BY CASES AND BALANCE - CURED"
+    _apply(ws[f"AA{group_row}"], s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    ws.merge_cells(f"AN{group_row}:AR{group_row}")
+    ws[f"AN{group_row}"] = f"{month_label} - VARIANCE (CURED COUNT - PTP COUNT)"
+    _apply(ws[f"AN{group_row}"], s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    current_row = group_row + 2
+
+    for status in TABLE_STATUSES:
+        current_row = _write_status_row_four_groups(
+            ws=ws,
+            month_label=month_label,
+            status=status,
+            overall_summary=overall_summary,
+            ptp_summary=ptp_summary,
+            cured_summary=cured_summary,
+            start_row=current_row,
+            s=s,
+        )
+
+    return current_row + 2
+
+
+def _build_charts_sheet(wb: Workbook, source_df: pd.DataFrame, s: dict) -> None:
+    ws = wb.create_sheet("Charts")
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A4"
+
+    for col in range(1, 56):
+        letter = _col(col)
+        if col in (1, 14, 27, 40):
+            ws.column_dimensions[letter].width = 16
+        elif col in (2, 3, 15, 16, 28, 29, 41, 42, 43):
+            ws.column_dimensions[letter].width = 12
+        else:
+            ws.column_dimensions[letter].width = 10
+
+    ws.merge_cells("A1:BC1")
+    ws["A1"] = "RESPONSE RATE CHARTS"
+    _apply(ws["A1"], s["fill_title"], s["font_title"], s["left"], s["border"])
+
+    ws.merge_cells("A2:BC2")
+    ws["A2"] = (
+        "Charts below are larger versions of the original layout. "
+        "Regular charts show Cycle below the bars and Count inside the bars. "
+        "Variance is computed as CURED Count - PTP Count using a safe horizontal red bar chart."
+    )
+    _apply(ws["A2"], s["fill_white"], s["font_body"], s["left"], s["border"])
+
+    current_row = 4
+
+    overall_summary = build_summary_table(source_df)
+    ptp_all_df = filter_ptp(source_df)
+    cured_all_df = filter_cured(source_df)
+
+    ptp_all_summary = build_sub_summary_table(ptp_all_df) if not ptp_all_df.empty else None
+    cured_all_summary = build_sub_summary_table(cured_all_df) if not cured_all_df.empty else None
+
+    current_row = _write_month_chart_section(
+        ws=ws,
+        month_label="ALL MONTHS",
+        overall_summary=overall_summary,
+        ptp_summary=ptp_all_summary,
+        cured_summary=cured_all_summary,
+        start_row=current_row,
+        s=s,
+    )
+
+    for month_num in get_detected_months(source_df):
+        mname = month_num_to_name(month_num)
+        month_df = filter_by_cutoff_month(source_df, month_num)
+        ptp_df = filter_ptp(month_df)
+        cured_df = filter_cured(month_df)
+
+        month_summary = build_summary_table(month_df)
+        ptp_summary = build_sub_summary_table(ptp_df) if not ptp_df.empty else None
+        cured_summary = build_sub_summary_table(cured_df) if not cured_df.empty else None
+
+        current_row = _write_month_chart_section(
+            ws=ws,
+            month_label=mname,
+            overall_summary=month_summary,
+            ptp_summary=ptp_summary,
+            cured_summary=cured_summary,
+            start_row=current_row,
+            s=s,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workbook builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_formatted_excel(source_df: pd.DataFrame, month_span_label: str) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "Dashboard"
     ws.sheet_view.showGridLines = False
 
-    # Set column widths for all 41 used columns
     for c in range(1, 42):
         letter = _col(c)
-        # gap columns (N=14, AB=28)
         if c in (14, 28):
             ws.column_dimensions[letter].width = 2
-        # label columns (A=1, O=15, AC=29)
         elif c in (1, 15, 29):
             ws.column_dimensions[letter].width = 22
-        # total columns now placed right after Cycle
         elif c in (2, 3, 16, 17, 30, 31):
             ws.column_dimensions[letter].width = 18
         else:
@@ -571,15 +1111,16 @@ def build_formatted_excel(source_df: pd.DataFrame, month_span_label: str) -> byt
     s = _make_styles()
     cur = 1
 
-    # ── OVERALL (all months) ──────────────────────────────────────────────────
     overall_summary = build_summary_table(source_df)
     overall_pct     = build_percentage_table(overall_summary, is_sub=False)
     ptp_all         = filter_ptp(source_df)
     cured_all       = filter_cured(source_df)
+
     ptp_all_summary = build_sub_summary_table(ptp_all)   if not ptp_all.empty   else None
     cured_all_sum   = build_sub_summary_table(cured_all) if not cured_all.empty else None
-    ptp_all_pct     = build_percentage_table(ptp_all_summary, is_sub=True) if ptp_all_summary is not None else None
-    cured_all_pct   = build_percentage_table(cured_all_sum, is_sub=True) if cured_all_sum is not None else None
+
+    ptp_all_pct   = build_percentage_table(ptp_all_summary, is_sub=True) if ptp_all_summary is not None else None
+    cured_all_pct = build_percentage_table(cured_all_sum,  is_sub=True) if cured_all_sum is not None else None
 
     cur = _write_summary_side_by_side(
         ws,
@@ -601,7 +1142,6 @@ def build_formatted_excel(source_df: pd.DataFrame, month_span_label: str) -> byt
     )
     cur += 3
 
-    # ── PER MONTH ─────────────────────────────────────────────────────────────
     for month_num in get_detected_months(source_df):
         mname         = month_num_to_name(month_num)
         month_df      = filter_by_cutoff_month(source_df, month_num)
@@ -635,6 +1175,8 @@ def build_formatted_excel(source_df: pd.DataFrame, month_span_label: str) -> byt
         )
         cur += 3
 
+    _build_charts_sheet(wb, source_df, s)
+
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
@@ -642,7 +1184,7 @@ def build_formatted_excel(source_df: pd.DataFrame, month_span_label: str) -> byt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Streamlit UI
+# Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def response_rate():
@@ -673,7 +1215,7 @@ def response_rate():
 
     try:
         month_span_label = get_month_span_label(source_df)
-        detected_months  = get_detected_months(source_df)
+        detected_months = get_detected_months(source_df)
     except Exception as exc:
         st.error(f"Unable to parse month data: {exc}")
         st.stop()
@@ -683,7 +1225,6 @@ def response_rate():
         f"({month_span_label})"
     )
 
-    # ── Overall previews ──────────────────────────────────────────────────────
     try:
         overall_summary = build_summary_table(source_df)
         overall_pct     = build_percentage_table(overall_summary, is_sub=False)
@@ -701,21 +1242,13 @@ def response_rate():
     with col2:
         st.caption("PTP")
         if not ptp_all.empty:
-            st.dataframe(
-                to_flat_preview(build_sub_summary_table(ptp_all)),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(to_flat_preview(build_sub_summary_table(ptp_all)), use_container_width=True, hide_index=True)
         else:
             st.caption("No PTP data.")
     with col3:
         st.caption("CURED")
         if not cured_all.empty:
-            st.dataframe(
-                to_flat_preview(build_sub_summary_table(cured_all)),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(to_flat_preview(build_sub_summary_table(cured_all)), use_container_width=True, hide_index=True)
         else:
             st.caption("No CURED data.")
 
@@ -728,22 +1261,17 @@ def response_rate():
         st.caption("PTP")
         if not ptp_all.empty:
             p = build_sub_summary_table(ptp_all)
-            st.dataframe(
-                to_flat_preview(build_percentage_table(p, is_sub=True)),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(to_flat_preview(build_percentage_table(p, is_sub=True)), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No PTP data.")
     with col3:
         st.caption("CURED")
         if not cured_all.empty:
             p = build_sub_summary_table(cured_all)
-            st.dataframe(
-                to_flat_preview(build_percentage_table(p, is_sub=True)),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(to_flat_preview(build_percentage_table(p, is_sub=True)), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No CURED data.")
 
-    # ── Per-month previews ────────────────────────────────────────────────────
     for month_num in detected_months:
         mname    = month_num_to_name(month_num)
         month_df = filter_by_cutoff_month(source_df, month_num)
@@ -764,21 +1292,13 @@ def response_rate():
             with c2:
                 st.caption("PTP")
                 if not ptp_df.empty:
-                    st.dataframe(
-                        to_flat_preview(build_sub_summary_table(ptp_df)),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    st.dataframe(to_flat_preview(build_sub_summary_table(ptp_df)), use_container_width=True, hide_index=True)
                 else:
                     st.caption("No PTP data.")
             with c3:
                 st.caption("CURED")
                 if not cured_df.empty:
-                    st.dataframe(
-                        to_flat_preview(build_sub_summary_table(cured_df)),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    st.dataframe(to_flat_preview(build_sub_summary_table(cured_df)), use_container_width=True, hide_index=True)
                 else:
                     st.caption("No CURED data.")
 
@@ -791,29 +1311,20 @@ def response_rate():
                 st.caption("PTP")
                 if not ptp_df.empty:
                     ps = build_sub_summary_table(ptp_df)
-                    st.dataframe(
-                        to_flat_preview(build_percentage_table(ps, is_sub=True)),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    st.dataframe(to_flat_preview(build_percentage_table(ps, is_sub=True)), use_container_width=True, hide_index=True)
                 else:
                     st.caption("No PTP data.")
             with c3:
                 st.caption("CURED")
                 if not cured_df.empty:
                     cs = build_sub_summary_table(cured_df)
-                    st.dataframe(
-                        to_flat_preview(build_percentage_table(cs, is_sub=True)),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    st.dataframe(to_flat_preview(build_percentage_table(cs, is_sub=True)), use_container_width=True, hide_index=True)
                 else:
                     st.caption("No CURED data.")
 
         except Exception as exc:
             st.error(f"Error building {mname} tables: {exc}")
 
-    # ── Download ──────────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("Download All Tables")
 
