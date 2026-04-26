@@ -3,6 +3,7 @@ import streamlit as st
 from remarks_generator import render_remarks_generator
 from report_generator import render_report_generator
 from rfd import render_rfd_mapper
+from response_rate import response_rate
 
 
 st.set_page_config(page_title="BPI Automation", layout="wide")
@@ -218,6 +219,7 @@ if main_mode == "📊 Report Generator":
             "❌ NEGATIVE Status",
             "🏍️ FIELD RESULT",
             "🧾 RFD Mapper",
+            "RESPONSE RATE"
         ],
         label_visibility="collapsed"
     )
@@ -231,5 +233,7 @@ if main_mode == "📋 Remarks Generator":
 elif main_mode == "📊 Report Generator" and report_mode is not None:
     if report_mode == "🧾 RFD Mapper":
         render_rfd_mapper()
+    if report_mode == "RESPONSE RATE":
+        response_rate()
     else:
         render_report_generator(report_mode)
