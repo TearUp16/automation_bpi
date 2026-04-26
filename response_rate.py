@@ -8,6 +8,7 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.marker import DataPoint
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -42,11 +43,23 @@ STATUS_ALIASES = {
     "SELF-CURED": "SELF CURED",
 }
 
-# Dashboard layout
 OVERALL_START = 1
 PTP_START     = 15
 CURED_START   = 29
 BLOCK_WIDTH   = 13
+
+# Chart color constants
+OVERALL_BAR_COLOR = "FF0000"   # red
+OVERALL_LINE_COLOR = "FFFF00"  # yellow
+
+PTP_BAR_COLOR = "4F81BD"       # blue
+PTP_LINE_COLOR = "FF0000"      # red
+
+CURED_BAR_COLOR = "4F81BD"     # blue
+CURED_LINE_COLOR = "FF0000"    # red
+
+VARIANCE_POSITIVE_BAR_COLOR = "4F81BD"  # blue
+VARIANCE_NEGATIVE_BAR_COLOR = "D9EAF7"  # light blue
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +348,8 @@ def _make_styles() -> dict:
         fill_white=PatternFill("solid", fgColor="FFFFFF"),
         fill_green=PatternFill("solid", fgColor="C6EFCE"),
         fill_yellow=PatternFill("solid", fgColor="FFF2CC"),
+        fill_blue=PatternFill("solid", fgColor="4F81BD"),
+        fill_light_blue=PatternFill("solid", fgColor="D9EAF7"),
         border=Border(left=thin, right=thin, top=thin, bottom=thin),
         font_title=Font(name="Arial", size=12, bold=True, color="000000"),
         font_hdr=Font(name="Arial", size=10, bold=True, color="FFFFFF"),
@@ -550,7 +565,7 @@ def _write_rate_side_by_side(
             ]
             for offset, value in enumerate(values, start=1):
                 cl = ws.cell(i, c + offset, float(value))
-                _apply(cl, s["fill_white"], bfont, s["right"], s["border"], "0%")
+                _apply(cl, s["fill_white"], bfont, s["right"], s["border"], "0.00%")
 
         max_data_rows = max(max_data_rows, len(tbl))
 
@@ -592,13 +607,9 @@ def _add_combo_chart(
     data_start_row: int,
     data_end_row: int,
     anchor: str,
+    bar_color: str,
+    line_color: str,
 ):
-    """
-    Bigger regular chart:
-    - Cycle labels below the bars
-    - Count inside the bars
-    - OB as yellow line
-    """
     cats = Reference(
         ws,
         min_col=table_col_start,
@@ -628,13 +639,11 @@ def _add_combo_chart(
     bar.style = 10
     bar.title = title
     bar.y_axis.title = "Count"
-
-    # CHANGED: bigger chart size
     bar.height = 10.5
     bar.width = 13.5
-
     bar.gapWidth = 60
-    bar.legend.position = "r"
+    bar.legend.position = "tr"
+    bar.legend.overlay = True
     bar.x_axis.tickLblPos = "nextTo"
     bar.x_axis.delete = False
 
@@ -657,15 +666,13 @@ def _add_combo_chart(
         pass
 
     if bar.ser:
-        bar.ser[0].graphicalProperties.solidFill = "FF0000"
-        bar.ser[0].graphicalProperties.line.solidFill = "FF0000"
+        bar.ser[0].graphicalProperties.solidFill = bar_color
+        bar.ser[0].graphicalProperties.line.solidFill = bar_color
 
     line = LineChart()
     line.y_axis.title = "OB"
     line.y_axis.axId = 200
     line.y_axis.crosses = "max"
-
-    # CHANGED: match bigger chart size
     line.height = 10.5
     line.width = 13.5
 
@@ -676,8 +683,18 @@ def _add_combo_chart(
     except Exception:
         pass
 
+    line.dLbls = DataLabelList()
+    line.dLbls.showVal = True
+    line.dLbls.showCatName = False
+    line.dLbls.showSerName = False
+    line.dLbls.showLegendKey = False
+    try:
+        line.dLbls.position = "t"
+    except Exception:
+        pass
+
     if line.ser:
-        line.ser[0].graphicalProperties.line.solidFill = "FFFF00"
+        line.ser[0].graphicalProperties.line.solidFill = line_color
         line.ser[0].graphicalProperties.line.width = 28575
 
     bar += line
@@ -693,21 +710,12 @@ def _add_variance_chart(
     data_end_row: int,
     anchor: str,
 ):
-    """
-    Bigger variance chart:
-    Variance = CURED Count - PTP Count
-    Bars red
-    Labels show Cycle and Variance value
-    """
     chart = BarChart()
     chart.type = "bar"
     chart.style = 10
     chart.title = title
-
-    # CHANGED: bigger chart size
     chart.height = 10.5
     chart.width = 13.5
-
     chart.gapWidth = 35
     chart.legend = None
     chart.x_axis.title = "Variance Count (CURED - PTP)"
@@ -747,8 +755,19 @@ def _add_variance_chart(
         pass
 
     if chart.ser:
-        chart.ser[0].graphicalProperties.solidFill = "FF0000"
-        chart.ser[0].graphicalProperties.line.solidFill = "FF0000"
+        ser = chart.ser[0]
+        ser.graphicalProperties.solidFill = VARIANCE_POSITIVE_BAR_COLOR
+        ser.graphicalProperties.line.solidFill = VARIANCE_POSITIVE_BAR_COLOR
+        ser.dPt = []
+
+        for idx, row_num in enumerate(range(data_start_row, data_end_row + 1)):
+            val = ws.cell(row=row_num, column=table_col_start + 3).value
+            fill = VARIANCE_POSITIVE_BAR_COLOR if (val or 0) >= 0 else VARIANCE_NEGATIVE_BAR_COLOR
+
+            pt = DataPoint(idx=idx)
+            pt.graphicalProperties.solidFill = fill
+            pt.graphicalProperties.line.solidFill = fill
+            ser.dPt.append(pt)
 
     ws.add_chart(chart, anchor)
 
@@ -762,6 +781,8 @@ def _write_chart_block_at(
     table_col_start: int,
     chart_anchor: str,
     s: dict,
+    bar_color: str,
+    line_color: str,
 ) -> None:
     title_start_col = table_col_start
     title_end_col = table_col_start + 2
@@ -820,6 +841,8 @@ def _write_chart_block_at(
         data_start_row=data_start_row,
         data_end_row=data_end_row,
         anchor=chart_anchor,
+        bar_color=bar_color,
+        line_color=line_color,
     )
 
 
@@ -838,7 +861,10 @@ def _write_variance_block_at(
 
     ws.merge_cells(f"{_col(title_start_col)}{start_row}:{_col(title_end_col)}{start_row}")
     ws.cell(start_row, title_start_col, block_title)
-    _apply(ws.cell(start_row, title_start_col), s["fill_title"], s["font_title"], s["left"], s["border"])
+    _apply(
+        ws.cell(start_row, title_start_col),
+        s["fill_title"], s["font_title"], s["left"], s["border"]
+    )
 
     header_row = start_row + 1
     headers = ["Cycle", "PTP Count", "CURED Count", "Variance"]
@@ -864,19 +890,10 @@ def _write_variance_block_at(
                 if offset == 0:
                     _apply(cl, s["fill_white"], s["font_body"], s["left"], s["border"])
                 else:
-                    fill = s["fill_white"]
-                    if offset == 3 and variance > 0:
-                        fill = s["fill_green"]
-                    elif offset == 3 and variance < 0:
-                        fill = s["fill_yellow"]
-
-                    _apply(cl, fill, s["font_body"], s["right"], s["border"])
+                    _apply(cl, s["fill_white"], s["font_body"], s["right"], s["border"])
 
                 if offset >= 1:
-                    if offset == 3:
-                        cl.number_format = '#,##0;[Red]-#,##0'
-                    else:
-                        cl.number_format = '#,##0'
+                    cl.number_format = '#,##0;[Red]-#,##0'
 
         data_end_row = data_start_row + len(rows) - 1
     else:
@@ -920,7 +937,6 @@ def _write_status_row_four_groups(
     cured_rows   = _extract_status_chart_rows(cured_summary, status, is_sub=True)
     variance_rows = build_variance_rows(ptp_summary, cured_summary, status)
 
-    # CHANGED: more vertical room for bigger charts
     block_height = max(
         max(len(overall_rows), len(ptp_rows), len(cured_rows), len(variance_rows)) + 8,
         24
@@ -935,6 +951,8 @@ def _write_status_row_four_groups(
         table_col_start=1,
         chart_anchor=f"E{start_row}",
         s=s,
+        bar_color=OVERALL_BAR_COLOR,
+        line_color=OVERALL_LINE_COLOR,
     )
 
     _write_chart_block_at(
@@ -946,6 +964,8 @@ def _write_status_row_four_groups(
         table_col_start=14,
         chart_anchor=f"R{start_row}",
         s=s,
+        bar_color=PTP_BAR_COLOR,
+        line_color=PTP_LINE_COLOR,
     )
 
     _write_chart_block_at(
@@ -957,6 +977,8 @@ def _write_status_row_four_groups(
         table_col_start=27,
         chart_anchor=f"AE{start_row}",
         s=s,
+        bar_color=CURED_BAR_COLOR,
+        line_color=CURED_LINE_COLOR,
     )
 
     _write_variance_block_at(
@@ -1041,9 +1063,9 @@ def _build_charts_sheet(wb: Workbook, source_df: pd.DataFrame, s: dict) -> None:
 
     ws.merge_cells("A2:BC2")
     ws["A2"] = (
-        "Charts below are larger versions of the original layout. "
-        "Regular charts show Cycle below the bars and Count inside the bars. "
-        "Variance is computed as CURED Count - PTP Count using a safe horizontal red bar chart."
+        "Overall charts use red bars and yellow lines. "
+        "PTP and CURED charts use blue bars and red lines. "
+        "Variance charts use blue for positive bars and light blue for negative bars."
     )
     _apply(ws["A2"], s["fill_white"], s["font_body"], s["left"], s["border"])
 
